@@ -1,0 +1,1508 @@
+// Niveshaay Communication Center — PostgreSQL schema
+//
+// Source-of-truth boundaries:
+//   * Zoho CRM owns client identity + contact details (clients.* crm fields are overwritten by sync).
+//   * PostgreSQL owns categories, memberships, template mappings, campaigns, consents,
+//     suppressions and audit records. CRM sync NEVER writes to client_categories.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ───────────────────────────── Enums ─────────────────────────────
+
+enum RoleKey {
+  ADMIN
+  CAMPAIGN_CREATOR
+  APPROVER
+  VIEWER
+  COMPLIANCE_OFFICER
+}
+
+enum Channel {
+  EMAIL
+  WHATSAPP
+}
+
+enum ChannelMode {
+  EMAIL
+  WHATSAPP
+  BOTH
+}
+
+enum Provider {
+  ZOHO_CRM
+  ZOHO_MA
+  DOUBLETICK
+}
+
+enum ProviderMode {
+  MOCK // simulated adapter, simulated events, always labelled
+  DRY_RUN // real config, renders + validates, never calls send endpoints
+  LIVE // real sends — requires env ALLOW_LIVE_SEND=true + admin enablement + per-campaign confirmation
+}
+
+enum IntegrationStatus {
+  NOT_CONFIGURED
+  CONFIGURED
+  CONNECTED
+  ERROR
+  DISCONNECTED
+}
+
+enum MembershipSource {
+  MANUAL
+  BULK
+  CSV
+  RULE
+}
+
+enum MembershipAction {
+  ADDED
+  REMOVED
+}
+
+enum TemplateApprovalStatus {
+  DRAFT
+  PENDING
+  APPROVED
+  REJECTED
+  DISABLED
+}
+
+enum CampaignPurpose {
+  RESEARCH_UPDATE
+  PORTFOLIO_ADVISORY
+  SERVICE_NOTICE
+  EVENT_INVITATION
+  REGULATORY_DISCLOSURE
+  MARKETING
+  OTHER
+}
+
+enum CampaignStatus {
+  DRAFT
+  PENDING_APPROVAL
+  REJECTED
+  APPROVED
+  SCHEDULED
+  QUEUED
+  RUNNING
+  PAUSED
+  COMPLETED
+  CANCELLED
+  FAILED
+}
+
+enum OverlapStrategy {
+  PRIORITY // highest-priority selected category wins
+  PER_CATEGORY // one message per matched category (only when explicitly permitted)
+  EXCLUDE_CONFLICTS // drop recipients whose matched categories map to different templates
+  MANUAL_REVIEW // default: conflicting recipients held until a reviewer decides
+}
+
+enum RecipientStatus {
+  ELIGIBLE
+  EXCLUDED
+  NEEDS_REVIEW
+}
+
+enum ExclusionReason {
+  MISSING_EMAIL
+  MISSING_PHONE
+  INVALID_EMAIL
+  INVALID_PHONE
+  UNSUBSCRIBED
+  NO_CONSENT
+  SUPPRESSED
+  CRM_OPT_OUT
+  CONFLICT_EXCLUDED
+  CONFLICT_UNRESOLVED
+  CLIENT_INACTIVE
+  DUPLICATE_IDENTITY
+  MISSING_TEMPLATE_DATA
+}
+
+enum AssignmentStatus {
+  PLANNED
+  NEEDS_REVIEW
+  EXCLUDED
+}
+
+enum DeliveryStatus {
+  PENDING // created, not yet handed to provider
+  QUEUED // in job queue
+  SUBMITTED // request sent, awaiting provider response
+  ACCEPTED // provider API accepted (NOT delivered)
+  SENT // provider reports sent to network
+  DELIVERED
+  READ
+  FAILED
+  BOUNCED
+  CANCELLED
+  DRY_RUN // rendered + validated only, no provider call
+}
+
+enum DeliveryEventSource {
+  SYSTEM
+  API_RESPONSE
+  WEBHOOK
+  REPORT_RECONCILIATION
+  SIMULATION
+}
+
+enum ConsentStatus {
+  GRANTED
+  REVOKED
+}
+
+enum ConsentSource {
+  CRM
+  MANUAL
+  CSV
+  PROVIDER_UNSUBSCRIBE
+  CLIENT_REQUEST
+}
+
+enum SuppressionReason {
+  UNSUBSCRIBED
+  HARD_BOUNCE
+  COMPLAINT
+  MANUAL
+  DND
+  INVALID_CONTACT
+  LEGAL_HOLD
+}
+
+enum IdentifierType {
+  EMAIL
+  PHONE
+}
+
+enum SyncType {
+  INITIAL
+  INCREMENTAL
+  MANUAL
+  DELETED_RECORDS
+  RULE_EVALUATION
+  PROVIDER_REPORT
+  AUDIENCE_SYNC
+}
+
+enum SyncStatus {
+  RUNNING
+  SUCCEEDED
+  PARTIAL
+  FAILED
+}
+
+enum WebhookStatus {
+  RECEIVED
+  PROCESSED
+  DUPLICATE
+  IGNORED
+  REJECTED
+  FAILED
+}
+
+// ───────────────────────────── Identity & access ─────────────────────────────
+
+model Role {
+  id          String   @id @default(cuid())
+  key         RoleKey  @unique
+  name        String
+  description String?
+  users       User[]
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  @@map("roles")
+}
+
+model User {
+  id           String    @id @default(cuid())
+  email        String    @unique
+  name         String
+  passwordHash String    @map("password_hash")
+  roleId       String    @map("role_id")
+  role         Role      @relation(fields: [roleId], references: [id])
+  isActive     Boolean   @default(true) @map("is_active")
+  lastLoginAt  DateTime? @map("last_login_at")
+  failedLogins Int       @default(0) @map("failed_logins")
+  lockedUntil  DateTime? @map("locked_until")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+  deletedAt    DateTime? @map("deleted_at")
+
+  sessions           Session[]
+  auditLogs          AuditLog[]
+  createdCategories  Category[]        @relation("CategoryCreatedBy")
+  createdCampaigns   Campaign[]        @relation("CampaignCreatedBy")
+  updatedCampaigns   Campaign[]        @relation("CampaignUpdatedBy")
+  submittedCampaigns Campaign[]        @relation("CampaignSubmittedBy")
+  approvedCampaigns  Campaign[]        @relation("CampaignApprovedBy")
+  rejectedCampaigns  Campaign[]        @relation("CampaignRejectedBy")
+  cancelledCampaigns Campaign[]        @relation("CampaignCancelledBy")
+  membershipEvents   MembershipEvent[]
+  templateVersions   TemplateVersion[]
+
+  @@map("users")
+}
+
+model Session {
+  id         String   @id @default(cuid())
+  tokenHash  String   @unique @map("token_hash")
+  userId     String   @map("user_id")
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt  DateTime @map("expires_at")
+  ipAddress  String?  @map("ip_address")
+  userAgent  String?  @map("user_agent")
+  createdAt  DateTime @default(now()) @map("created_at")
+  lastSeenAt DateTime @default(now()) @map("last_seen_at")
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("sessions")
+}
+
+// ───────────────────────────── Clients (CRM mirror) ─────────────────────────────
+
+model Client {
+  id               String    @id @default(cuid())
+  zohoCrmId        String    @unique @map("zoho_crm_id")
+  crmModule        String    @default("Contacts") @map("crm_module")
+  firstName        String?   @map("first_name")
+  lastName         String?   @map("last_name")
+  fullName         String    @map("full_name")
+  email            String?
+  emailNormalized  String?   @map("email_normalized")
+  secondaryEmail   String?   @map("secondary_email")
+  phoneRaw         String?   @map("phone_raw")
+  phoneE164        String?   @map("phone_e164")
+  phoneCountry     String?   @map("phone_country") // ISO-3166 alpha-2
+  phoneCountryCode String?   @map("phone_country_code") // e.g. "91"
+  phoneValid       Boolean   @default(false) @map("phone_valid")
+  crmStatus        String?   @map("crm_status")
+  crmOwner         String?   @map("crm_owner")
+  city             String?
+  crmEmailOptOut   Boolean   @default(false) @map("crm_email_opt_out")
+  crmFields        Json      @default("{}") @map("crm_fields") // whitelisted extra CRM fields for rules
+  crmModifiedAt    DateTime? @map("crm_modified_at")
+  lastSyncedAt     DateTime? @map("last_synced_at")
+  deletedInCrmAt   DateTime? @map("deleted_in_crm_at")
+  duplicateOfId    String?   @map("duplicate_of_id")
+  duplicateOf      Client?   @relation("ClientDuplicates", fields: [duplicateOfId], references: [id])
+  duplicates       Client[]  @relation("ClientDuplicates")
+  isMock           Boolean   @default(false) @map("is_mock")
+  createdAt        DateTime  @default(now()) @map("created_at")
+  updatedAt        DateTime  @updatedAt @map("updated_at")
+
+  memberships      ClientCategory[]
+  membershipEvents MembershipEvent[]
+  consents         Consent[]
+  suppressions     SuppressionEntry[]
+  recipients       CampaignRecipient[]
+  deliveries       MessageDelivery[]
+
+  @@index([emailNormalized])
+  @@index([phoneE164])
+  @@index([fullName])
+  @@index([crmModifiedAt])
+  @@index([duplicateOfId])
+  @@map("clients")
+}
+
+// ───────────────────────────── Categories ─────────────────────────────
+
+model Category {
+  id          String    @id @default(cuid())
+  name        String
+  slug        String    @unique
+  description String?
+  color       String    @default("#1F4E79")
+  priority    Int       @default(100) // lower = higher precedence when PRIORITY overlap strategy is used
+  createdById String?   @map("created_by_id")
+  createdBy   User?     @relation("CategoryCreatedBy", fields: [createdById], references: [id])
+  archivedAt  DateTime? @map("archived_at")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+
+  memberships      ClientCategory[]
+  membershipEvents MembershipEvent[]
+  rules            CategoryRule[]
+  templates        CategoryTemplate[]
+  campaigns        CampaignCategory[]
+  assignments      CampaignMessageAssignment[]
+
+  @@index([archivedAt])
+  @@map("categories")
+}
+
+/// Many-to-many membership. Soft-removed rows keep history; re-adding clears removed_at.
+model ClientCategory {
+  id          String           @id @default(cuid())
+  clientId    String           @map("client_id")
+  client      Client           @relation(fields: [clientId], references: [id], onDelete: Restrict)
+  categoryId  String           @map("category_id")
+  category    Category         @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  source      MembershipSource
+  ruleId      String?          @map("rule_id")
+  rule        CategoryRule?    @relation(fields: [ruleId], references: [id])
+  addedById   String?          @map("added_by_id")
+  addedAt     DateTime         @default(now()) @map("added_at")
+  removedAt   DateTime?        @map("removed_at")
+  removedById String?          @map("removed_by_id")
+
+  @@unique([clientId, categoryId])
+  @@index([categoryId, removedAt])
+  @@index([clientId, removedAt])
+  @@map("client_categories")
+}
+
+model MembershipEvent {
+  id         String           @id @default(cuid())
+  clientId   String           @map("client_id")
+  client     Client           @relation(fields: [clientId], references: [id])
+  categoryId String           @map("category_id")
+  category   Category         @relation(fields: [categoryId], references: [id])
+  action     MembershipAction
+  source     MembershipSource
+  actorId    String?          @map("actor_id")
+  actor      User?            @relation(fields: [actorId], references: [id])
+  note       String?
+  createdAt  DateTime         @default(now()) @map("created_at")
+
+  @@index([categoryId, createdAt])
+  @@index([clientId, createdAt])
+  @@map("membership_events")
+}
+
+/// Dashboard-defined dynamic rule evaluated against mirrored CRM data.
+/// Rule evaluation only adds/removes memberships whose source = RULE and rule_id = this rule.
+model CategoryRule {
+  id              String    @id @default(cuid())
+  categoryId      String    @map("category_id")
+  category        Category  @relation(fields: [categoryId], references: [id])
+  name            String
+  definition      Json // validated by RuleDefinitionSchema (src/lib/contracts/rules.ts)
+  isActive        Boolean   @default(true) @map("is_active")
+  autoRemove      Boolean   @default(false) @map("auto_remove")
+  lastEvaluatedAt DateTime? @map("last_evaluated_at")
+  lastMatchCount  Int?      @map("last_match_count")
+  createdById     String?   @map("created_by_id")
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+  archivedAt      DateTime? @map("archived_at")
+
+  memberships ClientCategory[]
+
+  @@index([categoryId])
+  @@map("category_rules")
+}
+
+// ───────────────────────────── Templates ─────────────────────────────
+
+/// Local registry of provider templates. Content is linked (not authored) where the
+/// provider does not support template creation via API.
+model Template {
+  id                 String                 @id @default(cuid())
+  channel            Channel
+  name               String
+  description        String?
+  provider           Provider
+  providerTemplateId String?                @map("provider_template_id") // DoubleTick template name / Zoho MA campaign key
+  language           String? // WhatsApp language code e.g. "en"
+  subject            String? // email subject (preview/render)
+  senderName         String?                @map("sender_name")
+  body               String // preview body with {{variable}} tokens
+  header             Json? // WA header {type, text|mediaUrl, filename}
+  buttons            Json? // WA buttons [{type, index, variable?}]
+  variables          Json                   @default("[]") // [{key,label,source,required,sample}]
+  approvalStatus     TemplateApprovalStatus @default(DRAFT) @map("approval_status")
+  currentVersion     Int                    @default(1) @map("current_version")
+  archivedAt         DateTime?              @map("archived_at")
+  createdAt          DateTime               @default(now()) @map("created_at")
+  updatedAt          DateTime               @updatedAt @map("updated_at")
+
+  versions    TemplateVersion[]
+  categories  CategoryTemplate[]
+  assignments CampaignMessageAssignment[]
+
+  @@unique([channel, name])
+  @@index([channel, approvalStatus])
+  @@map("templates")
+}
+
+model TemplateVersion {
+  id          String   @id @default(cuid())
+  templateId  String   @map("template_id")
+  template    Template @relation(fields: [templateId], references: [id])
+  version     Int
+  snapshot    Json // full template content at this version
+  contentHash String   @map("content_hash")
+  changeNote  String?  @map("change_note")
+  createdById String?  @map("created_by_id")
+  createdBy   User?    @relation(fields: [createdById], references: [id])
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  assignments CampaignMessageAssignment[]
+
+  @@unique([templateId, version])
+  @@map("template_versions")
+}
+
+/// Authorises a template for use with a category.
+model CategoryTemplate {
+  id          String    @id @default(cuid())
+  categoryId  String    @map("category_id")
+  category    Category  @relation(fields: [categoryId], references: [id])
+  templateId  String    @map("template_id")
+  template    Template  @relation(fields: [templateId], references: [id])
+  channel     Channel
+  isDefault   Boolean   @default(false) @map("is_default")
+  createdById String?   @map("created_by_id")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  removedAt   DateTime? @map("removed_at")
+
+  @@unique([categoryId, templateId])
+  @@index([templateId])
+  @@map("category_templates")
+}
+
+// ───────────────────────────── Campaigns ─────────────────────────────
+
+model Campaign {
+  id                 String          @id @default(cuid())
+  name               String
+  description        String?
+  purpose            CampaignPurpose
+  channelMode        ChannelMode     @map("channel_mode")
+  status             CampaignStatus  @default(DRAFT)
+  overlapStrategy    OverlapStrategy @default(MANUAL_REVIEW) @map("overlap_strategy")
+  scheduledAt        DateTime?       @map("scheduled_at")
+  timezone           String          @default("Asia/Kolkata")
+  rateLimitPerMinute Int             @default(60) @map("rate_limit_per_minute")
+  isLive             Boolean         @default(false) @map("is_live") // false = dry-run / mock execution
+  version            Int             @default(1) // optimistic locking
+
+  createdById     String    @map("created_by_id")
+  createdBy       User      @relation("CampaignCreatedBy", fields: [createdById], references: [id])
+  updatedById     String?   @map("updated_by_id")
+  updatedBy       User?     @relation("CampaignUpdatedBy", fields: [updatedById], references: [id])
+  submittedById   String?   @map("submitted_by_id")
+  submittedBy     User?     @relation("CampaignSubmittedBy", fields: [submittedById], references: [id])
+  submittedAt     DateTime? @map("submitted_at")
+  approvedById    String?   @map("approved_by_id")
+  approvedBy      User?     @relation("CampaignApprovedBy", fields: [approvedById], references: [id])
+  approvedAt      DateTime? @map("approved_at")
+  approvalNote    String?   @map("approval_note")
+  rejectedById    String?   @map("rejected_by_id")
+  rejectedBy      User?     @relation("CampaignRejectedBy", fields: [rejectedById], references: [id])
+  rejectedAt      DateTime? @map("rejected_at")
+  rejectionReason String?   @map("rejection_reason")
+  liveConfirmedAt DateTime? @map("live_confirmed_at")
+  queuedAt        DateTime? @map("queued_at")
+  startedAt       DateTime? @map("started_at")
+  pausedAt        DateTime? @map("paused_at")
+  completedAt     DateTime? @map("completed_at")
+  cancelledAt     DateTime? @map("cancelled_at")
+  cancelledById   String?   @map("cancelled_by_id")
+  cancelledBy     User?     @relation("CampaignCancelledBy", fields: [cancelledById], references: [id])
+  failureReason   String?   @map("failure_reason")
+  providerRefs    Json      @default("{}") @map("provider_refs") // e.g. { zohoMa: { groups: [...] } }
+  reviewDecisions Json      @default("{}") @map("review_decisions") // { [clientId]: { EMAIL?: {categoryId}|{exclude:true}, WHATSAPP?: ... } }
+  testSendCount   Int       @default(0) @map("test_send_count")
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+  deletedAt       DateTime? @map("deleted_at")
+
+  categories  CampaignCategory[]
+  recipients  CampaignRecipient[]
+  assignments CampaignMessageAssignment[]
+  deliveries  MessageDelivery[]
+  snapshot    CampaignSnapshot?
+
+  @@index([status, scheduledAt])
+  @@index([createdAt])
+  @@map("campaigns")
+}
+
+model CampaignCategory {
+  id                    String   @id @default(cuid())
+  campaignId            String   @map("campaign_id")
+  campaign              Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  categoryId            String   @map("category_id")
+  category              Category @relation(fields: [categoryId], references: [id])
+  priority              Int      @default(1) // explicit precedence within this campaign (1 = highest)
+  emailTemplateId       String?  @map("email_template_id")
+  whatsappTemplateId    String?  @map("whatsapp_template_id")
+  memberCountAtSnapshot Int?     @map("member_count_at_snapshot")
+
+  @@unique([campaignId, categoryId])
+  @@unique([campaignId, priority])
+  @@map("campaign_categories")
+}
+
+/// Frozen at approval. Protected from UPDATE/DELETE by a database trigger.
+model CampaignSnapshot {
+  id          String   @id @default(cuid())
+  campaignId  String   @unique @map("campaign_id")
+  campaign    Campaign @relation(fields: [campaignId], references: [id])
+  frozenAt    DateTime @default(now()) @map("frozen_at")
+  frozenById  String   @map("frozen_by_id")
+  summary     Json // counts, exclusions, overlap stats
+  categories  Json // membership counts + template versions at approval
+  contentHash String   @map("content_hash")
+
+  @@map("campaign_snapshots")
+}
+
+model CampaignRecipient {
+  id                 String            @id @default(cuid())
+  campaignId         String            @map("campaign_id")
+  campaign           Campaign          @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  clientId           String            @map("client_id")
+  client             Client            @relation(fields: [clientId], references: [id])
+  status             RecipientStatus
+  exclusionReasons   ExclusionReason[] @map("exclusion_reasons")
+  matchedCategoryIds String[]          @map("matched_category_ids")
+  contactSnapshot    Json              @map("contact_snapshot") // name/email/phone frozen at approval
+  consentDecision    Json              @map("consent_decision") // per-channel decision + evidence ids
+  createdAt          DateTime          @default(now()) @map("created_at")
+
+  assignments CampaignMessageAssignment[]
+
+  @@unique([campaignId, clientId])
+  @@index([campaignId, status])
+  @@map("campaign_recipients")
+}
+
+/// Final recipient → (channel, category, template) mapping. Unique per campaign/recipient/channel/template.
+model CampaignMessageAssignment {
+  id                String            @id @default(cuid())
+  campaignId        String            @map("campaign_id")
+  campaign          Campaign          @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  recipientId       String            @map("recipient_id")
+  recipient         CampaignRecipient @relation(fields: [recipientId], references: [id], onDelete: Cascade)
+  channel           Channel
+  categoryId        String            @map("category_id")
+  category          Category          @relation(fields: [categoryId], references: [id])
+  templateId        String            @map("template_id")
+  template          Template          @relation(fields: [templateId], references: [id])
+  templateVersionId String?           @map("template_version_id")
+  templateVersion   TemplateVersion?  @relation(fields: [templateVersionId], references: [id])
+  status            AssignmentStatus
+  rendered          Json? // rendered subject/body/placeholders at freeze
+  idempotencyKey    String            @unique @map("idempotency_key")
+  createdAt         DateTime          @default(now()) @map("created_at")
+
+  delivery MessageDelivery?
+
+  @@unique([campaignId, recipientId, channel, templateId])
+  @@index([campaignId, status])
+  @@map("campaign_message_assignments")
+}
+
+model MessageDelivery {
+  id                String                    @id @default(cuid())
+  assignmentId      String                    @unique @map("assignment_id")
+  assignment        CampaignMessageAssignment @relation(fields: [assignmentId], references: [id])
+  campaignId        String                    @map("campaign_id")
+  campaign          Campaign                  @relation(fields: [campaignId], references: [id])
+  clientId          String                    @map("client_id")
+  client            Client                    @relation(fields: [clientId], references: [id])
+  channel           Channel
+  provider          Provider
+  status            DeliveryStatus            @default(PENDING)
+  providerMessageId String?                   @unique @map("provider_message_id")
+  attemptCount      Int                       @default(0) @map("attempt_count")
+  nextAttemptAt     DateTime?                 @map("next_attempt_at")
+  lastAttemptAt     DateTime?                 @map("last_attempt_at")
+  submittedAt       DateTime?                 @map("submitted_at")
+  acceptedAt        DateTime?                 @map("accepted_at")
+  sentAt            DateTime?                 @map("sent_at")
+  deliveredAt       DateTime?                 @map("delivered_at")
+  readAt            DateTime?                 @map("read_at")
+  openedAt          DateTime?                 @map("opened_at")
+  clickedAt         DateTime?                 @map("clicked_at")
+  failedAt          DateTime?                 @map("failed_at")
+  failureCode       String?                   @map("failure_code")
+  failureReason     String?                   @map("failure_reason")
+  isSimulated       Boolean                   @default(false) @map("is_simulated")
+  isDryRun          Boolean                   @default(false) @map("is_dry_run")
+  createdAt         DateTime                  @default(now()) @map("created_at")
+  updatedAt         DateTime                  @updatedAt @map("updated_at")
+
+  events DeliveryEvent[]
+
+  @@index([campaignId, status])
+  @@index([clientId, createdAt])
+  @@index([status, nextAttemptAt])
+  @@map("message_deliveries")
+}
+
+model DeliveryEvent {
+  id         String              @id @default(cuid())
+  deliveryId String              @map("delivery_id")
+  delivery   MessageDelivery     @relation(fields: [deliveryId], references: [id])
+  source     DeliveryEventSource
+  fromStatus DeliveryStatus?     @map("from_status")
+  toStatus   DeliveryStatus      @map("to_status")
+  detail     Json? // masked provider response / error
+  occurredAt DateTime            @map("occurred_at")
+  createdAt  DateTime            @default(now()) @map("created_at")
+
+  @@index([deliveryId, occurredAt])
+  @@map("delivery_events")
+}
+
+// ───────────────────────────── Consent & suppression ─────────────────────────────
+
+/// Append-only. The latest effective record per (client, channel) is the current decision.
+model Consent {
+  id           String        @id @default(cuid())
+  clientId     String        @map("client_id")
+  client       Client        @relation(fields: [clientId], references: [id])
+  channel      Channel
+  status       ConsentStatus
+  source       ConsentSource
+  purpose      String        @default("communications")
+  evidence     String?
+  recordedById String?       @map("recorded_by_id")
+  effectiveAt  DateTime      @default(now()) @map("effective_at")
+  createdAt    DateTime      @default(now()) @map("created_at")
+
+  @@index([clientId, channel, effectiveAt])
+  @@map("consents")
+}
+
+model SuppressionEntry {
+  id              String            @id @default(cuid())
+  channel         Channel? // null = all channels
+  identifierType  IdentifierType    @map("identifier_type")
+  identifierValue String            @map("identifier_value") // normalized email / E.164
+  clientId        String?           @map("client_id")
+  client          Client?           @relation(fields: [clientId], references: [id])
+  reason          SuppressionReason
+  source          String
+  note            String?
+  createdById     String?           @map("created_by_id")
+  createdAt       DateTime          @default(now()) @map("created_at")
+  liftedAt        DateTime?         @map("lifted_at")
+  liftedById      String?           @map("lifted_by_id")
+
+  @@index([identifierType, identifierValue, liftedAt])
+  @@index([clientId])
+  @@map("suppression_entries")
+}
+
+model InternalTestRecipient {
+  id        String   @id @default(cuid())
+  name      String
+  email     String?
+  phoneE164 String?  @map("phone_e164")
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@map("internal_test_recipients")
+}
+
+// ───────────────────────────── Integrations & operations ─────────────────────────────
+
+model IntegrationSetting {
+  id               String            @id @default(cuid())
+  provider         Provider          @unique
+  mode             ProviderMode      @default(MOCK)
+  status           IntegrationStatus @default(NOT_CONFIGURED)
+  config           Json              @default("{}") // non-secret config (region, sender, etc.)
+  secretsEncrypted String?           @map("secrets_encrypted") // AES-256-GCM envelope
+  secretsHint      Json              @default("{}") @map("secrets_hint") // masked hints only
+  accountInfo      Json              @default("{}") @map("account_info")
+  apiUsage         Json              @default("{}") @map("api_usage")
+  lastSuccessAt    DateTime?         @map("last_success_at")
+  lastErrorAt      DateTime?         @map("last_error_at")
+  lastError        String?           @map("last_error")
+  lastSyncAt       DateTime?         @map("last_sync_at")
+  updatedById      String?           @map("updated_by_id")
+  createdAt        DateTime          @default(now()) @map("created_at")
+  updatedAt        DateTime          @updatedAt @map("updated_at")
+
+  @@map("integration_settings")
+}
+
+model SyncRun {
+  id            String     @id @default(cuid())
+  provider      Provider
+  type          SyncType
+  status        SyncStatus @default(RUNNING)
+  triggeredById String?    @map("triggered_by_id")
+  cursor        String? // incremental watermark / page token
+  stats         Json       @default("{}")
+  apiCalls      Int        @default(0) @map("api_calls")
+  errorMessage  String?    @map("error_message")
+  startedAt     DateTime   @default(now()) @map("started_at")
+  finishedAt    DateTime?  @map("finished_at")
+
+  @@index([provider, startedAt])
+  @@map("sync_runs")
+}
+
+model WebhookEvent {
+  id             String        @id @default(cuid())
+  provider       Provider
+  dedupeKey      String        @unique @map("dedupe_key")
+  signatureValid Boolean       @map("signature_valid")
+  status         WebhookStatus @default(RECEIVED)
+  headers        Json          @default("{}")
+  payload        Json
+  error          String?
+  attempts       Int           @default(0)
+  receivedAt     DateTime      @default(now()) @map("received_at")
+  processedAt    DateTime?     @map("processed_at")
+
+  @@index([provider, receivedAt])
+  @@index([status])
+  @@map("webhook_events")
+}
+
+/// Append-only (UPDATE blocked by trigger). Metadata must be PII-masked before insert.
+model AuditLog {
+  id         String   @id @default(cuid())
+  actorId    String?  @map("actor_id")
+  actor      User?    @relation(fields: [actorId], references: [id])
+  actorEmail String?  @map("actor_email")
+  action     String
+  entityType String   @map("entity_type")
+  entityId   String?  @map("entity_id")
+  campaignId String?  @map("campaign_id")
+  metadata   Json     @default("{}")
+  ipAddress  String?  @map("ip_address")
+  userAgent  String?  @map("user_agent")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  @@index([entityType, entityId])
+  @@index([campaignId, createdAt])
+  @@index([actorId, createdAt])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+model AppSetting {
+  key         String   @id
+  value       Json
+  updatedById String?  @map("updated_by_id")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  @@map("app_settings")
+}
+
+// ═════════════════════ SALESFORCE MARKETING CLOUD ARCHIVE ═════════════════════
+//
+// Read-only backup of Salesforce Marketing Cloud Engagement (SFMC) for SEBI audit evidence.
+// Rules enforced in code and, where marked, by database triggers
+// (migration *_salesforce_archive_guards):
+//   * Nothing here is ever written back to Salesforce. The SFMC client only issues SOAP
+//     Retrieve and allow-listed REST GET/query calls.
+//   * Extracted rows/events are stored per dataset (one extraction of one object) keyed by
+//     (dataset, page, row) and never collapsed. A sealed dataset's rows cannot change.
+//   * Manifests and the archive audit log are append-only.
+//   * Source values are preserved as the strings SFMC returned (no numeric coercion).
+
+enum SfConnectionKind {
+  LIVE // real SFMC tenant via Installed Package (server-to-server)
+  SIMULATED // in-process fake SFMC for development and tests; refused in production; every record flagged
+}
+
+enum SfConnectionStatus {
+  NOT_CONFIGURED
+  CONFIGURED
+  CONNECTED
+  ERROR
+}
+
+enum SfBackupMode {
+  FULL
+  INCREMENTAL
+}
+
+enum SfBackupJobStatus {
+  QUEUED
+  RUNNING
+  CANCELLING
+  CANCELLED
+  COMPLETED // all requested datasets extracted (see verificationStatus for completeness)
+  COMPLETED_WITH_GAPS // some datasets failed, inaccessible or not retrievable
+  FAILED
+}
+
+enum SfDatasetKind {
+  BUSINESS_UNITS
+  DATA_FOLDERS
+  DE_INVENTORY // DataExtension + DataExtensionField metadata
+  DE_ROWS // DataExtensionObject rows of one DE
+  SUBSCRIBERS
+  LISTS
+  EMAIL_JOBS // SOAP Send objects
+  TRIGGERED_SENDS // TriggeredSendDefinition metadata
+  TRACKING_SENT
+  TRACKING_OPEN
+  TRACKING_CLICK
+  TRACKING_BOUNCE
+  TRACKING_UNSUB
+  TRACKING_NOTSENT
+  JOURNEYS
+  AUTOMATIONS
+  QUERY_DEFINITIONS
+  CONTENT_ASSETS
+  CONTENT_CATEGORIES
+  AUDIENCE_UPLOAD // independently preserved audience snapshot uploaded by a user
+  EMAILS // SOAP Email objects (HTML/text of the emails referenced by send jobs)
+  CONTENT_FILES // images / PDFs referenced by archived content, downloaded from their published URLs
+}
+
+enum SfDatasetStatus {
+  PENDING
+  RUNNING
+  EXTRACTED // pagination finished; see verificationStatus
+  FAILED
+  CANCELLED
+  NOT_ACCESSIBLE // permission / scope / object not available for this account
+  NOT_RETRIEVABLE // outside the source retention window or unsupported by the API
+}
+
+enum SfVerificationStatus {
+  VERIFIED
+  PARTIALLY_VERIFIED
+  UNVERIFIED
+  FAILED
+  NOT_ACCESSIBLE
+  NOT_RETRIEVABLE
+}
+
+enum SfTrackingEventType {
+  SENT
+  OPEN
+  CLICK
+  BOUNCE
+  UNSUB
+  NOTSENT
+}
+
+enum SfReconStatus {
+  QUEUED
+  RUNNING
+  COMPLETED
+  FAILED
+}
+
+enum SfReconClass {
+  MATCHED_SENT // in audience and observed in send tracking
+  AUDIENCE_NO_SENT_EVENT // in audience, no observed SentEvent (evidence, if any, in flags)
+  TRACKING_NOT_IN_AUDIENCE // observed SentEvent, absent from the supplied audience
+  DUPLICATE_AUDIENCE_ROW // 2nd+ audience row with the same normalised identity
+  INVALID_IDENTIFIER // audience row with missing/invalid identity value
+  RETENTION_UNAVAILABLE // send tracking for the job is not retrievable / not extracted
+  UNRESOLVED // insufficient evidence to classify
+}
+
+model SalesforceConnection {
+  id               String             @id @default(cuid())
+  name             String
+  kind             SfConnectionKind   @default(LIVE)
+  status           SfConnectionStatus @default(NOT_CONFIGURED)
+  authBaseUri      String?            @map("auth_base_uri")
+  restBaseUri      String?            @map("rest_base_uri") // from token response unless overridden
+  soapBaseUri      String?            @map("soap_base_uri") // from token response unless overridden
+  enterpriseMid    String?            @map("enterprise_mid")
+  defaultMid       String?            @map("default_mid")
+  secretsEncrypted String?            @map("secrets_encrypted") // AES-256-GCM envelope {clientId, clientSecret}
+  secretsHint      Json               @default("{}") @map("secrets_hint")
+  grantedScopes    String[]           @default([]) @map("granted_scopes")
+  accountInfo      Json               @default("{}") @map("account_info") // /v2/userinfo (non-secret)
+  capabilities     Json               @default("{}") // per-object read probe results
+  settings         Json               @default("{}") // rate limits, source timezone, retention notes
+  lastTestedAt     DateTime?          @map("last_tested_at")
+  lastSuccessAt    DateTime?          @map("last_success_at")
+  lastErrorAt      DateTime?          @map("last_error_at")
+  lastError        String?            @map("last_error")
+  createdById      String?            @map("created_by_id")
+  createdAt        DateTime           @default(now()) @map("created_at")
+  updatedAt        DateTime           @updatedAt @map("updated_at")
+  archivedAt       DateTime?          @map("archived_at")
+
+  businessUnits SalesforceBusinessUnit[]
+  backupJobs    SalesforceBackupJob[]
+  schedules     SalesforceBackupSchedule[]
+
+  @@map("salesforce_connections")
+}
+
+model SalesforceBusinessUnit {
+  id           String               @id @default(cuid())
+  connectionId String               @map("connection_id")
+  connection   SalesforceConnection @relation(fields: [connectionId], references: [id])
+  mid          String // MIDs kept as strings (no numeric coercion)
+  name         String
+  parentMid    String?              @map("parent_mid")
+  customerKey  String?              @map("customer_key")
+  isEnterprise Boolean              @default(false) @map("is_enterprise")
+  isActive     Boolean?             @map("is_active")
+  selected     Boolean              @default(false) // included in backups by default
+  source       String // "soap:BusinessUnit" | "userinfo" | "manual"
+  raw          Json                 @default("{}")
+  discoveredAt DateTime             @default(now()) @map("discovered_at")
+  updatedAt    DateTime             @updatedAt @map("updated_at")
+
+  @@unique([connectionId, mid])
+  @@map("salesforce_business_units")
+}
+
+model SalesforceBackupJob {
+  id                 String               @id @default(cuid())
+  code               String               @unique // BKP-yyyyMMdd-xxxxxx
+  connectionId       String               @map("connection_id")
+  connection         SalesforceConnection @relation(fields: [connectionId], references: [id])
+  mids               String[]
+  mode               SfBackupMode         @default(FULL)
+  scope              Json // selected data types, DE keys, date range
+  status             SfBackupJobStatus    @default(QUEUED)
+  verificationStatus SfVerificationStatus @default(UNVERIFIED) @map("verification_status")
+  verificationNotes  Json                 @default("[]") @map("verification_notes")
+  stats              Json                 @default("{}")
+  isSimulated        Boolean              @default(false) @map("is_simulated")
+  scheduleId         String?              @map("schedule_id")
+  parentJobId        String?              @map("parent_job_id") // retry-of
+  createdById        String?              @map("created_by_id")
+  createdByEmail     String?              @map("created_by_email")
+  cancelRequestedAt  DateTime?            @map("cancel_requested_at")
+  leaseUntil         DateTime?            @map("lease_until") // single-runner lease for step jobs
+  stepCount          Int                  @default(0) @map("step_count")
+  startedAt          DateTime?            @map("started_at")
+  finishedAt         DateTime?            @map("finished_at")
+  errorMessage       String?              @map("error_message")
+  createdAt          DateTime             @default(now()) @map("created_at")
+  updatedAt          DateTime             @updatedAt @map("updated_at")
+
+  datasets SalesforceBackupDataset[]
+
+  @@index([connectionId, createdAt])
+  @@index([status])
+  @@map("salesforce_backup_jobs")
+}
+
+model SalesforceBackupSchedule {
+  id            String               @id @default(cuid())
+  connectionId  String               @map("connection_id")
+  connection    SalesforceConnection @relation(fields: [connectionId], references: [id])
+  name          String
+  scope         Json
+  mids          String[]
+  intervalHours Int                  @map("interval_hours")
+  enabled       Boolean              @default(true)
+  nextRunAt     DateTime             @map("next_run_at")
+  lastRunAt     DateTime?            @map("last_run_at")
+  lastJobId     String?              @map("last_job_id")
+  createdById   String?              @map("created_by_id")
+  createdAt     DateTime             @default(now()) @map("created_at")
+  updatedAt     DateTime             @updatedAt @map("updated_at")
+
+  @@index([enabled, nextRunAt])
+  @@map("salesforce_backup_schedules")
+}
+
+model SalesforceBackupDataset {
+  id                  String               @id @default(cuid())
+  backupJobId         String?              @map("backup_job_id")
+  backupJob           SalesforceBackupJob? @relation(fields: [backupJobId], references: [id])
+  connectionId        String               @map("connection_id")
+  mid                 String
+  kind                SfDatasetKind
+  objectType          String               @map("object_type") // SOAP object / REST resource
+  sourceKey           String?              @map("source_key") // DE CustomerKey, JobID, …
+  label               String
+  status              SfDatasetStatus      @default(PENDING)
+  verificationStatus  SfVerificationStatus @default(UNVERIFIED) @map("verification_status")
+  verificationDetails Json                 @default("{}") @map("verification_details")
+  params              Json                 @default("{}") // filters, date window, schema snapshot
+  checkpoint          Json                 @default("{}") // { requestId, nextPage, restPage }
+  attempt             Int                  @default(1)
+  pagesFetched        Int                  @default(0) @map("pages_fetched")
+  recordsExtracted    Int                  @default(0) @map("records_extracted")
+  sourceCount         Int?                 @map("source_count") // independently obtained count
+  sourceCountMethod   String?              @map("source_count_method")
+  apiCalls            Int                  @default(0) @map("api_calls")
+  retries             Int                  @default(0)
+  bytesStored         BigInt               @default(0) @map("bytes_stored")
+  coverageFrom        DateTime?            @map("coverage_from")
+  coverageTo          DateTime?            @map("coverage_to")
+  isSimulated         Boolean              @default(false) @map("is_simulated")
+  errorMessage        String?              @map("error_message")
+  supersededById      String?              @map("superseded_by_id")
+  startedAt           DateTime?            @map("started_at")
+  finishedAt          DateTime?            @map("finished_at")
+  lastProgressAt      DateTime?            @map("last_progress_at")
+  sealedAt            DateTime?            @map("sealed_at") // rows immutable after this
+  verifiedAt          DateTime?            @map("verified_at")
+  createdById         String?              @map("created_by_id")
+  createdAt           DateTime             @default(now()) @map("created_at")
+
+  pages SalesforceBackupPage[]
+
+  @@index([backupJobId])
+  @@index([connectionId, mid, kind, sourceKey])
+  @@index([kind, status])
+  @@index([kind, status, supersededById], map: "salesforce_backup_datasets_current_idx")
+  @@map("salesforce_backup_datasets")
+}
+
+/// One SFMC response page: the raw payload is stored encrypted in the archive store; its hash is kept here.
+model SalesforceBackupPage {
+  id            String                  @id @default(cuid())
+  datasetId     String                  @map("dataset_id")
+  dataset       SalesforceBackupDataset @relation(fields: [datasetId], references: [id])
+  attempt       Int
+  pageNo        Int                     @map("page_no")
+  recordCount   Int                     @map("record_count")
+  requestId     String?                 @map("request_id")
+  overallStatus String?                 @map("overall_status")
+  storageKey    String                  @map("storage_key")
+  sha256        String // of the raw (unencrypted) payload
+  byteSize      Int                     @map("byte_size")
+  fetchedAt     DateTime                @default(now()) @map("fetched_at")
+
+  @@unique([datasetId, attempt, pageNo])
+  @@map("salesforce_backup_pages")
+}
+
+model SalesforceBackupManifest {
+  id             String   @id @default(cuid())
+  scope          String // DATASET | JOB | EVIDENCE
+  backupJobId    String?  @map("backup_job_id")
+  datasetId      String?  @map("dataset_id")
+  version        Int      @default(1)
+  manifest       Json
+  sha256         String // of the canonical manifest JSON
+  previousSha256 String?  @map("previous_sha256") // hash chain per backup job
+  storageKey     String?  @map("storage_key")
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  @@index([backupJobId])
+  @@index([datasetId])
+  @@map("salesforce_backup_manifests")
+}
+
+model SalesforceDataExtension {
+  id                  String    @id @default(cuid())
+  connectionId        String    @map("connection_id")
+  mid                 String
+  objectId            String?   @map("object_id")
+  customerKey         String    @map("customer_key")
+  name                String
+  description         String?
+  categoryId          String?   @map("category_id") // folder
+  folderPath          String?   @map("folder_path")
+  isSendable          Boolean?  @map("is_sendable")
+  isTestable          Boolean?  @map("is_testable")
+  sendableField       String?   @map("sendable_field")
+  retention           Json      @default("{}")
+  createdDate         String?   @map("created_date") // as returned by SFMC
+  modifiedDate        String?   @map("modified_date")
+  raw                 Json      @default("{}")
+  inventoryDatasetId  String?   @map("inventory_dataset_id")
+  latestRowsDatasetId String?   @map("latest_rows_dataset_id")
+  attestedCount       Int?      @map("attested_count") // count read from the SFMC UI by an operator
+  attestedById        String?   @map("attested_by_id")
+  attestedByEmail     String?   @map("attested_by_email")
+  attestedAt          DateTime? @map("attested_at")
+  attestationNote     String?   @map("attestation_note")
+  isSimulated         Boolean   @default(false) @map("is_simulated")
+  firstSeenAt         DateTime  @default(now()) @map("first_seen_at")
+  lastSeenAt          DateTime  @default(now()) @map("last_seen_at")
+
+  fields SalesforceDataExtensionField[]
+
+  @@unique([connectionId, mid, customerKey])
+  @@index([mid, customerKey])
+  @@index([name])
+  @@map("salesforce_data_extensions")
+}
+
+model SalesforceDataExtensionField {
+  id              String                  @id @default(cuid())
+  dataExtensionId String                  @map("data_extension_id")
+  dataExtension   SalesforceDataExtension @relation(fields: [dataExtensionId], references: [id])
+  name            String
+  fieldType       String?                 @map("field_type")
+  maxLength       String?                 @map("max_length")
+  scale           String?
+  isPrimaryKey    Boolean?                @map("is_primary_key")
+  isRequired      Boolean?                @map("is_required") // nullable = !isRequired
+  ordinal         Int?
+  defaultValue    String?                 @map("default_value")
+  raw             Json                    @default("{}")
+
+  @@unique([dataExtensionId, name])
+  @@map("salesforce_data_extension_fields")
+}
+
+model SalesforceDataExtensionRow {
+  id              BigInt  @id @default(autoincrement())
+  datasetId       String  @map("dataset_id")
+  dataExtensionId String? @map("data_extension_id") // null for AUDIENCE_UPLOAD
+  pageNo          Int     @map("page_no")
+  rowNo           Int     @map("row_no")
+  values          Json // { fieldName: "string value as returned" }
+  rowHash         String  @map("row_hash")
+  primaryKey      String? @map("primary_key") // joined PK values, for lookup
+
+  @@unique([datasetId, pageNo, rowNo])
+  @@index([datasetId, primaryKey])
+  @@index([datasetId, rowHash])
+  @@index([values(ops: JsonbPathOps)], type: Gin, map: "salesforce_data_extension_rows_values_gin")
+  @@map("salesforce_data_extension_rows")
+}
+
+model SalesforceSubscriber {
+  id               BigInt  @id @default(autoincrement())
+  datasetId        String  @map("dataset_id")
+  connectionId     String  @map("connection_id")
+  mid              String
+  pageNo           Int     @map("page_no")
+  rowNo            Int     @map("row_no")
+  subscriberKey    String? @map("subscriber_key")
+  subscriberId     String? @map("subscriber_id")
+  emailAddress     String? @map("email_address")
+  status           String?
+  createdDate      String? @map("created_date")
+  unsubscribedDate String? @map("unsubscribed_date")
+  raw              Json    @default("{}")
+
+  @@unique([datasetId, pageNo, rowNo])
+  @@index([subscriberKey])
+  @@index([emailAddress])
+  @@map("salesforce_subscribers")
+}
+
+model SalesforceEmailJob {
+  id                 String    @id @default(cuid())
+  connectionId       String    @map("connection_id")
+  mid                String
+  jobId              String    @map("job_id") // Send.ID (= SendID / JobID in tracking)
+  emailId            String?   @map("email_id")
+  emailName          String?   @map("email_name")
+  subject            String?
+  fromName           String?   @map("from_name")
+  fromAddress        String?   @map("from_address")
+  sendClassification String?   @map("send_classification")
+  status             String?
+  sendDate           DateTime? @map("send_date") // parsed (raw keeps the original string)
+  sentDate           DateTime? @map("sent_date")
+  createdDate        String?   @map("created_date")
+  counters           Json      @default("{}") // NumberTargeted, NumberSent, NumberExcluded, … as returned
+  targets            Json      @default("{}") // list / DE identifiers where available
+  triggeredSendKey   String?   @map("triggered_send_key")
+  raw                Json      @default("{}")
+  datasetId          String    @map("dataset_id")
+  isSimulated        Boolean   @default(false) @map("is_simulated")
+  firstSeenAt        DateTime  @default(now()) @map("first_seen_at")
+  lastSeenAt         DateTime  @default(now()) @map("last_seen_at")
+
+  @@unique([connectionId, mid, jobId])
+  @@index([mid, jobId])
+  @@index([emailId])
+  @@index([sentDate])
+  @@map("salesforce_email_jobs")
+}
+
+model SalesforceTrackingEvent {
+  id                    BigInt              @id @default(autoincrement())
+  datasetId             String              @map("dataset_id")
+  connectionId          String              @map("connection_id")
+  mid                   String
+  eventType             SfTrackingEventType @map("event_type")
+  jobId                 String?             @map("job_id") // SendID
+  subscriberKey         String?             @map("subscriber_key")
+  subscriberId          String?             @map("subscriber_id")
+  eventDate             DateTime?           @map("event_date") // parsed (UTC)
+  eventDateRaw          String?             @map("event_date_raw") // exactly as returned
+  batchId               String?             @map("batch_id")
+  listId                String?             @map("list_id")
+  triggeredSendObjectId String?             @map("triggered_send_object_id")
+  url                   String?
+  urlId                 String?             @map("url_id")
+  bounceCategory        String?             @map("bounce_category")
+  bounceType            String?             @map("bounce_type")
+  smtpCode              String?             @map("smtp_code")
+  smtpReason            String?             @map("smtp_reason")
+  sourceEventType       String?             @map("source_event_type") // EventType as returned
+  raw                   Json                @default("{}")
+  fingerprint           String // hash of identifying fields; duplicates are detected, never dropped
+  pageNo                Int                 @map("page_no")
+  rowNo                 Int                 @map("row_no")
+
+  @@unique([datasetId, pageNo, rowNo])
+  @@index([mid, jobId, eventType])
+  @@index([subscriberKey])
+  @@index([eventDate])
+  @@index([datasetId, fingerprint])
+  @@index([subscriberKey, datasetId], map: "salesforce_tracking_events_subscriber_dataset_idx")
+  @@map("salesforce_tracking_events")
+}
+
+/// SOAP Email object: the email definition a send job references (Send.Email.ID). HTML and text
+/// bodies are stored unaltered in the archive store; this row keeps metadata and hashes.
+model SalesforceEmail {
+  id             String    @id @default(cuid())
+  connectionId   String    @map("connection_id")
+  mid            String
+  emailId        String    @map("email_id")
+  name           String?
+  subject        String?
+  preheader      String?
+  emailType      String?   @map("email_type")
+  createdDate    String?   @map("created_date") // as returned by SFMC
+  modifiedDate   String?   @map("modified_date")
+  modifiedAt     DateTime? @map("modified_at") // parsed (source offset applied)
+  htmlStorageKey String?   @map("html_storage_key")
+  htmlSha256     String?   @map("html_sha256")
+  htmlBytes      Int?      @map("html_bytes")
+  textStorageKey String?   @map("text_storage_key")
+  textSha256     String?   @map("text_sha256")
+  references     Json      @default("[]")
+  raw            Json      @default("{}") // without the bodies (those are in the archive store)
+  datasetId      String    @map("dataset_id")
+  isSimulated    Boolean   @default(false) @map("is_simulated")
+  firstSeenAt    DateTime  @default(now()) @map("first_seen_at")
+  lastSeenAt     DateTime  @default(now()) @map("last_seen_at")
+
+  @@unique([connectionId, mid, emailId])
+  @@map("salesforce_emails")
+}
+
+/// A file (image, PDF, …) referenced by archived content, downloaded from its public URL so
+/// archived emails still render after the Salesforce account is closed.
+model SalesforceContentFile {
+  id           String   @id @default(cuid())
+  connectionId String   @map("connection_id")
+  url          String
+  assetId      String?  @map("asset_id") // Content Builder asset, when the URL is an asset's publishedURL
+  storageKey   String?  @map("storage_key")
+  sha256       String?
+  bytes        Int?
+  contentType  String?  @map("content_type")
+  httpStatus   Int?     @map("http_status")
+  error        String?
+  datasetId    String   @map("dataset_id")
+  fetchedAt    DateTime @default(now()) @map("fetched_at")
+
+  @@unique([connectionId, url])
+  @@map("salesforce_content_files")
+}
+
+model SalesforceAsset {
+  id                String   @id @default(cuid())
+  connectionId      String   @map("connection_id")
+  mid               String
+  assetId           String   @map("asset_id")
+  legacyId          String?  @map("legacy_id") // legacyData.legacyId = the Email ID referenced by send jobs
+  customerKey       String?  @map("customer_key")
+  name              String?
+  assetType         String?  @map("asset_type")
+  categoryId        String?  @map("category_id")
+  categoryPath      String?  @map("category_path")
+  subject           String?
+  preheader         String?
+  createdDate       String?  @map("created_date")
+  modifiedDate      String?  @map("modified_date")
+  contentStorageKey String?  @map("content_storage_key") // encrypted original content
+  contentSha256     String?  @map("content_sha256")
+  contentBytes      Int?     @map("content_bytes")
+  references        Json     @default("[]") // external images / asset refs and their resolution
+  raw               Json     @default("{}")
+  datasetId         String   @map("dataset_id")
+  isSimulated       Boolean  @default(false) @map("is_simulated")
+  firstSeenAt       DateTime @default(now()) @map("first_seen_at")
+  lastSeenAt        DateTime @default(now()) @map("last_seen_at")
+
+  @@unique([connectionId, mid, assetId])
+  @@index([name])
+  @@index([connectionId, mid, legacyId])
+  @@map("salesforce_assets")
+}
+
+model SalesforceJourney {
+  id             String   @id @default(cuid())
+  connectionId   String   @map("connection_id")
+  mid            String
+  journeyId      String   @map("journey_id")
+  key            String?
+  name           String?
+  version        Int
+  status         String?
+  definitionType String?  @map("definition_type")
+  createdDate    String?  @map("created_date")
+  modifiedDate   String?  @map("modified_date")
+  entrySources   Json     @default("[]") @map("entry_sources")
+  activities     Json     @default("[]")
+  gaps           Json     @default("[]") // fields / history not available from the API
+  raw            Json     @default("{}")
+  datasetId      String   @map("dataset_id")
+  isSimulated    Boolean  @default(false) @map("is_simulated")
+  firstSeenAt    DateTime @default(now()) @map("first_seen_at")
+  lastSeenAt     DateTime @default(now()) @map("last_seen_at")
+
+  @@unique([connectionId, mid, journeyId, version])
+  @@map("salesforce_journeys")
+}
+
+model SalesforceAutomation {
+  id           String   @id @default(cuid())
+  connectionId String   @map("connection_id")
+  mid          String
+  kind         String // AUTOMATION | QUERY_DEFINITION
+  objectId     String   @map("object_id")
+  customerKey  String?  @map("customer_key")
+  name         String?
+  description  String?
+  status       String?
+  schedule     Json     @default("{}")
+  activities   Json     @default("[]")
+  definition   String? // e.g. QueryText
+  gaps         Json     @default("[]")
+  raw          Json     @default("{}")
+  datasetId    String   @map("dataset_id")
+  isSimulated  Boolean  @default(false) @map("is_simulated")
+  firstSeenAt  DateTime @default(now()) @map("first_seen_at")
+  lastSeenAt   DateTime @default(now()) @map("last_seen_at")
+
+  @@unique([connectionId, mid, kind, objectId])
+  @@map("salesforce_automations")
+}
+
+model SalesforceReconciliationJob {
+  id                String        @id @default(cuid())
+  code              String        @unique // REC-yyyyMMdd-xxxxxx
+  name              String
+  connectionId      String?       @map("connection_id")
+  mid               String
+  jobIds            String[]      @map("job_ids")
+  sendDateFrom      DateTime?     @map("send_date_from")
+  sendDateTo        DateTime?     @map("send_date_to")
+  audienceDatasetId String        @map("audience_dataset_id")
+  audienceSource    String        @map("audience_source") // DE_BACKUP | UPLOAD
+  audienceLabel     String        @map("audience_label") // CURRENT_STATE | HISTORICAL_EVIDENCED
+  audienceEvidence  Json          @default("{}") @map("audience_evidence")
+  identityMapping   Json          @map("identity_mapping")
+  status            SfReconStatus @default(QUEUED)
+  summary           Json          @default("{}")
+  limitations       Json          @default("[]")
+  inputsSha256      String?       @map("inputs_sha256")
+  errorMessage      String?       @map("error_message")
+  isSimulated       Boolean       @default(false) @map("is_simulated")
+  createdById       String?       @map("created_by_id")
+  createdByEmail    String?       @map("created_by_email")
+  createdAt         DateTime      @default(now()) @map("created_at")
+  startedAt         DateTime?     @map("started_at")
+  finishedAt        DateTime?     @map("finished_at")
+
+  results SalesforceReconciliationResult[]
+
+  @@index([mid, createdAt])
+  @@map("salesforce_reconciliation_jobs")
+}
+
+model SalesforceReconciliationResult {
+  id               BigInt                      @id @default(autoincrement())
+  reconciliationId String                      @map("reconciliation_id")
+  reconciliation   SalesforceReconciliationJob @relation(fields: [reconciliationId], references: [id], onDelete: Cascade)
+  identity         String? // normalised identity used for matching
+  rawIdentity      String?                     @map("raw_identity")
+  classification   SfReconClass
+  flags            String[]                    @default([]) // BOUNCE_EVENT, UNSUB_EVENT, NOTSENT_EVENT, …
+  audienceRefs     Json                        @default("[]") @map("audience_refs") // [{page,row}]
+  sentEventCount   Int                         @default(0) @map("sent_event_count")
+  firstSentAt      DateTime?                   @map("first_sent_at")
+  evidence         Json                        @default("{}")
+
+  @@index([reconciliationId, classification])
+  @@index([reconciliationId, identity])
+  @@map("salesforce_reconciliation_results")
+}
+
+model SalesforceEvidencePackage {
+  id             String   @id @default(cuid())
+  code           String   @unique // EVP-yyyyMMdd-xxxxxx
+  kind           String // CAMPAIGN | RECONCILIATION | SUBSCRIBER
+  title          String
+  params         Json
+  files          Json     @default("[]") // [{name, sha256, bytes, storageKey, contentType}]
+  manifestSha256 String?  @map("manifest_sha256")
+  status         String   @default("READY")
+  isSimulated    Boolean  @default(false) @map("is_simulated")
+  createdById    String?  @map("created_by_id")
+  createdByEmail String?  @map("created_by_email")
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  @@index([kind, createdAt])
+  @@map("salesforce_evidence_packages")
+}
+
+model SalesforceExtractionError {
+  id           String    @id @default(cuid())
+  connectionId String?   @map("connection_id")
+  backupJobId  String?   @map("backup_job_id")
+  datasetId    String?   @map("dataset_id")
+  mid          String?
+  objectType   String?   @map("object_type")
+  stage        String // auth | retrieve | rest | store | verify
+  httpStatus   Int?      @map("http_status")
+  code         String?
+  message      String
+  retryable    Boolean   @default(false)
+  attempt      Int       @default(1)
+  pageNo       Int?      @map("page_no")
+  resolvedAt   DateTime? @map("resolved_at")
+  createdAt    DateTime  @default(now()) @map("created_at")
+
+  @@index([backupJobId])
+  @@index([datasetId])
+  @@index([createdAt])
+  @@map("salesforce_extraction_errors")
+}
+
+model SalesforceExtractionLog {
+  id          BigInt   @id @default(autoincrement())
+  backupJobId String?  @map("backup_job_id")
+  datasetId   String?  @map("dataset_id")
+  level       String // info | warn | error
+  message     String
+  data        Json     @default("{}")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  @@index([backupJobId, createdAt])
+  @@index([datasetId, createdAt])
+  @@map("salesforce_extraction_logs")
+}
+
+model SalesforceArchiveAuditLog {
+  id         String   @id @default(cuid())
+  actorId    String?  @map("actor_id")
+  actorEmail String   @map("actor_email")
+  action     String // e.g. archive.export.csv, archive.evidence.generated
+  entityType String   @map("entity_type")
+  entityId   String?  @map("entity_id")
+  metadata   Json     @default("{}")
+  ipAddress  String?  @map("ip_address")
+  userAgent  String?  @map("user_agent")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  @@index([entityType, entityId])
+  @@index([actorId, createdAt])
+  @@index([createdAt])
+  @@map("salesforce_archive_audit_logs")
+}

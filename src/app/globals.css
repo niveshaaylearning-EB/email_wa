@@ -1,0 +1,193 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-sans);
+  --font-mono: var(--font-geist-mono);
+  --font-heading: var(--font-sans);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --color-brand: var(--brand);
+  --color-brand-accent: var(--brand-accent);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-info: var(--info);
+  --color-surface: var(--surface);
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+/*
+ * Niveshaay brand tokens. --brand / --brand-accent are overridden at runtime from
+ * Settings → Branding (injected in the root layout), so colours stay configurable.
+ */
+:root {
+  --brand: #1e3a5f;
+  --brand-accent: #0f8b6e;
+
+  --background: #f6f7f9;
+  --surface: #ffffff;
+  --foreground: #101828;
+  --card: #ffffff;
+  --card-foreground: #101828;
+  --popover: #ffffff;
+  --popover-foreground: #101828;
+  --primary: var(--brand);
+  --primary-foreground: #ffffff;
+  --secondary: #eef1f5;
+  --secondary-foreground: #1d2939;
+  --muted: #f0f2f5;
+  --muted-foreground: #5d6b82;
+  --accent: #eef2f7;
+  --accent-foreground: #1d2939;
+  --destructive: #c62828;
+  --success: #0f8b6e;
+  --warning: #b7791f;
+  --info: #2563eb;
+  --border: #e4e7ec;
+  --input: #d9dee6;
+  --ring: color-mix(in oklch, var(--brand) 55%, white);
+  --chart-1: color-mix(in oklch, var(--brand) 80%, #3b82f6);
+  --chart-2: var(--brand-accent);
+  --chart-3: #d4a017;
+  --chart-4: #7c5cbf;
+  --chart-5: #c2410c;
+  --radius: 0.625rem;
+  /* Data-viz tokens — validated categorical palette (dataviz validator: CVD/normal-vision/contrast) */
+  --viz-1: #2a78d6;
+  --viz-2: #eb6834;
+  --viz-3: #1baf7a;
+  --viz-critical: #d03b3b;
+  --viz-grid: #eceff3;
+  --viz-axis: #8a94a6;
+  --sidebar: #ffffff;
+  --sidebar-foreground: #344054;
+  --sidebar-primary: var(--brand);
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #f0f3f7;
+  --sidebar-accent-foreground: #101828;
+  --sidebar-border: #e8ebf0;
+  --sidebar-ring: color-mix(in oklch, var(--brand) 55%, white);
+}
+
+.dark {
+  --background: #0b1120;
+  --surface: #0f172a;
+  --foreground: #e6eaf2;
+  --card: #111a2c;
+  --card-foreground: #e6eaf2;
+  --popover: #111a2c;
+  --popover-foreground: #e6eaf2;
+  --primary: color-mix(in oklch, var(--brand) 45%, #9cc3ff);
+  --primary-foreground: #0b1120;
+  --secondary: #1a2438;
+  --secondary-foreground: #e6eaf2;
+  --muted: #172033;
+  --muted-foreground: #95a1b8;
+  --accent: #1a2438;
+  --accent-foreground: #e6eaf2;
+  --destructive: #f26b6b;
+  --success: #34c79a;
+  --warning: #e7b14c;
+  --info: #6aa0ff;
+  --border: #223049;
+  --input: #2a3a57;
+  --ring: color-mix(in oklch, var(--brand) 40%, #9cc3ff);
+  --chart-1: color-mix(in oklch, var(--brand) 35%, #8fb8ff);
+  --chart-2: color-mix(in oklch, var(--brand-accent) 70%, white);
+  --chart-3: #e7b84c;
+  --chart-4: #a98ae6;
+  --chart-5: #f08a5d;
+  --viz-1: #3987e5;
+  --viz-2: #d95926;
+  --viz-3: #199e70;
+  --viz-critical: #d03b3b;
+  --viz-grid: #1e2a40;
+  --viz-axis: #7d89a1;
+  --sidebar: #0d1526;
+  --sidebar-foreground: #b8c2d6;
+  --sidebar-primary: color-mix(in oklch, var(--brand) 45%, #9cc3ff);
+  --sidebar-primary-foreground: #0b1120;
+  --sidebar-accent: #172033;
+  --sidebar-accent-foreground: #e6eaf2;
+  --sidebar-border: #1c2840;
+  --sidebar-ring: color-mix(in oklch, var(--brand) 40%, #9cc3ff);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-feature-settings: "cv11", "ss01";
+  }
+  button:not(:disabled),
+  [role="button"]:not(:disabled) {
+    cursor: pointer;
+  }
+  html {
+    @apply font-sans;
+  }
+  .tabular {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+@layer utilities {
+  .animate-in-fade {
+    animation: ncc-fade 220ms ease-out both;
+  }
+  @keyframes ncc-fade {
+    from {
+      opacity: 0;
+      transform: translateY(3px);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .animate-in-fade {
+      animation: none;
+    }
+  }
+}

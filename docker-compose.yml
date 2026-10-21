@@ -1,0 +1,75 @@
+# Staging / single-host deployment. Put a TLS-terminating reverse proxy (Caddy, Nginx, ALB) in front
+# of `app` — webhooks and OAuth callbacks must be served over HTTPS.
+#
+#   cp .env.example .env.staging   # fill in values; keep ALLOW_LIVE_SEND=false for staging
+#   docker compose --env-file .env.staging up -d --build
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: ncc
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: niveshaay_cc
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ncc -d niveshaay_cc"]
+      interval: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes: [redisdata:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 20
+
+  migrate:
+    build: .
+    command: ["npx", "prisma", "migrate", "deploy"]
+    environment: &env
+      NODE_ENV: production
+      DATABASE_URL: postgresql://ncc:${POSTGRES_PASSWORD}@postgres:5432/niveshaay_cc
+      REDIS_URL: redis://redis:6379
+      APP_URL: ${APP_URL:?set APP_URL (public https URL)}
+      CREDENTIALS_ENCRYPTION_KEY: ${CREDENTIALS_ENCRYPTION_KEY:?set CREDENTIALS_ENCRYPTION_KEY}
+      SESSION_TTL_HOURS: ${SESSION_TTL_HOURS:-12}
+      ALLOW_LIVE_SEND: ${ALLOW_LIVE_SEND:-false}
+      LIVE_SEND_MAX_RECIPIENTS: ${LIVE_SEND_MAX_RECIPIENTS:-5000}
+      ZOHO_CLIENT_ID: ${ZOHO_CLIENT_ID:-}
+      ZOHO_CLIENT_SECRET: ${ZOHO_CLIENT_SECRET:-}
+      ZOHO_REDIRECT_URI: ${ZOHO_REDIRECT_URI:-}
+      ZOHO_DC: ${ZOHO_DC:-in}
+      DOUBLETICK_API_KEY: ${DOUBLETICK_API_KEY:-}
+      DOUBLETICK_SENDER_NUMBER: ${DOUBLETICK_SENDER_NUMBER:-}
+      DOUBLETICK_WEBHOOK_SECRET: ${DOUBLETICK_WEBHOOK_SECRET:-}
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: "no"
+
+  app:
+    build: .
+    environment: *env
+    ports: ["3000:3000"]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      retries: 5
+    restart: unless-stopped
+
+  worker:
+    build: .
+    command: ["npm", "run", "worker"]
+    environment: *env
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  redisdata:

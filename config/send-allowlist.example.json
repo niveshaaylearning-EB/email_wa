@@ -1,0 +1,5 @@
+{
+  "_note": "Copy to config/send-allowlist.local.json (git-ignored) and list the ONLY recipients allowed to receive real messages. Missing file = nobody can be messaged.",
+  "numbers": ["+910000000000"],
+  "emails": ["approved.person@example.com"]
+}
